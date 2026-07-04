@@ -815,6 +815,14 @@ def create_profile(
         except Exception:
             pass  # non-fatal — user can describe later with `hermes profile describe`
 
+    if not clone_all:
+        try:
+            from hermes_cli.profile_policy import seed_profile_policy
+
+            seed_profile_policy(profile_dir)
+        except Exception:
+            pass  # best-effort — new profiles still inherit the runtime default
+
     # Phase 4: when running inside a container under s6, register the
     # new profile's gateway as a runtime s6 service so
     # `hermes -p <profile> gateway start` can supervise it via

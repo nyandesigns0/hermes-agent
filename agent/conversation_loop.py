@@ -4563,6 +4563,38 @@ def run_conversation(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Final-response policy gate.
+    # Runs once near the final assistant return path, after plugin transforms
+    # and before post_llm_call/result packaging. Keep this seam fail-soft so
+    # the concise-by-default runtime policy never breaks the agent loop.
+    if final_response and not interrupted:
+        try:
+            from agent.final_response_policy import apply_final_response_policy
+
+            _policy_old_response = final_response
+            _policy_result = apply_final_response_policy(
+                response_text=final_response,
+                original_user_message=original_user_message,
+            )
+            if _policy_result.changed:
+                from agent.final_response_policy import sync_final_response_into_messages
+
+                final_response = _policy_result.response_text
+                sync_final_response_into_messages(
+                    messages=messages,
+                    old_response_text=_policy_old_response,
+                    new_response_text=final_response,
+                )
+                _response_transformed = True
+                logger.info(
+                    "Applied final-response policy %s (%s) session=%s",
+                    _policy_result.policy,
+                    _policy_result.reason,
+                    agent.session_id or "none",
+                )
+        except Exception as exc:
+            logger.warning("final-response policy failed: %s", exc)
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync

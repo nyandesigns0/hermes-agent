@@ -776,6 +776,24 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # Final-response policy gate — concise-by-default post-processing seam near the
+        # final assistant message return path. Keeps response-shaping
+        # enforcement profile/config driven without making skills executable.
+        "final_response_policy": {
+            "enabled": True,
+            "preset": "aas_default",
+        },
+        "final_response_policy_presets": {
+            "aas_default": {
+                "enabled": True,
+                "mode": "validate_and_trim",
+                "policies": ["progressive_disclosure"],
+                "progressive_disclosure": {
+                    "max_words": 100,
+                    "allow_explicit_full_answer": True,
+                },
+            },
+        },
     },
     
     "terminal": {

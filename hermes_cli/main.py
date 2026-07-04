@@ -10370,6 +10370,10 @@ def cmd_profile(args):
         _is_wrapper_dir_in_path,
         _get_wrapper_dir,
     )
+    from hermes_cli.profile_policy import (
+        audit_profile_policies,
+        apply_profile_policy_preset,
+    )
     from hermes_constants import display_hermes_home
 
     action = getattr(args, "profile_action", None)
@@ -10565,6 +10569,54 @@ def cmd_profile(args):
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    elif action == "policy":
+        subaction = getattr(args, "profile_policy_action", None)
+        if subaction is None:
+            print("Usage: hermes profile policy <audit|apply>")
+            sys.exit(2)
+
+        if subaction == "audit":
+            statuses = audit_profile_policies()
+            if not statuses:
+                print("No profiles found.")
+                return
+            print(f"\n {'Profile':<16} {'Action':<18} {'Preset':<12} {'Max words':<10} Notes")
+            print(f" {'─' * 15}    {'─' * 17}    {'─' * 11}    {'─' * 9}    {'─' * 40}")
+            for status in statuses:
+                preset = status.uses_preset or "—"
+                max_words = str(status.max_words) if status.max_words is not None else "—"
+                print(
+                    f"{status.name:<16} {status.action:<18} {preset:<12} {max_words:<10} {status.notes}"
+                )
+            print()
+            return
+
+        if subaction == "apply":
+            preset = getattr(args, "preset", "aas_default")
+            force = getattr(args, "force", False)
+            statuses = audit_profile_policies()
+            if not statuses:
+                print("No profiles found.")
+                return
+            print(f"Applying final-response policy preset '{preset}'...")
+            changed = 0
+            skipped = 0
+            for status in statuses:
+                profile_dir = status.path
+                applied = apply_profile_policy_preset(profile_dir, preset=preset, force=force)
+                if applied.notes.startswith("applied preset"):
+                    changed += 1
+                elif applied.action == "explicit_override":
+                    skipped += 1
+                print(
+                    f"{applied.name:<16} {applied.action:<18} {applied.notes}"
+                )
+            print(f"\nSummary: {changed} updated, {skipped} preserved explicit overrides.")
+            return
+
+        print("Usage: hermes profile policy <audit|apply>")
+        sys.exit(2)
 
     elif action == "describe":
         # Read or write a profile's description. The description is
@@ -14121,6 +14173,26 @@ Examples:
     profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
 
     profile_subparsers.add_parser("list", help="List all profiles")
+    profile_policy = profile_subparsers.add_parser(
+        "policy",
+        help="Audit or apply shared final-response policy presets",
+    )
+    profile_policy_subparsers = profile_policy.add_subparsers(dest="profile_policy_action")
+    profile_policy_subparsers.add_parser("audit", help="Audit profile final-response policies")
+    profile_policy_apply = profile_policy_subparsers.add_parser(
+        "apply",
+        help="Apply a shared final-response policy preset to profiles",
+    )
+    profile_policy_apply.add_argument(
+        "--preset",
+        default="aas_default",
+        help="Shared policy preset to apply (default: aas_default)",
+    )
+    profile_policy_apply.add_argument(
+        "--force",
+        action="store_true",
+        help="Override existing explicit profile policy settings",
+    )
     profile_use = profile_subparsers.add_parser(
         "use", help="Set sticky default profile"
     )
