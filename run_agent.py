@@ -1080,13 +1080,27 @@ class AIAgent:
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
+        # Explicit provider/model/environment settings are authoritative.  The
+        # adaptive policy below only improves Hermes's implicit default.
+        if not uses_implicit_default:
+            return stale_base
+
         from agent.chat_completion_helpers import estimate_request_context_tokens
+        from agent.provider_failure_policy import adaptive_stale_timeout
+
         est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
-            return max(stale_base, 240.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 150.0)
-        return stale_base
+            stale_base = max(stale_base, 240.0)
+        elif est_tokens > 50_000:
+            stale_base = max(stale_base, 150.0)
+
+        return adaptive_stale_timeout(
+            base_seconds=stale_base,
+            explicit=False,
+            api_payload=api_payload,
+            reasoning_config=getattr(self, "reasoning_config", None),
+            retry_multiplier=getattr(self, "_provider_stale_timeout_multiplier", 1.0),
+        )
 
     def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
         """Return an actionable hint when this request matches a known

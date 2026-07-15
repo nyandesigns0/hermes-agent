@@ -28,6 +28,11 @@ from typing import Any, Dict, Optional
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
+from agent.provider_failure_policy import (
+    AuthoritativeFailureState,
+    ProviderStaleError,
+    inspect_payload_workload,
+)
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -122,6 +127,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _provider_stale_error(
+    agent,
+    api_kwargs: dict,
+    *,
+    elapsed: float,
+    threshold: float,
+    phase: str,
+    transport_error: Optional[BaseException],
+    detail: str,
+) -> ProviderStaleError:
+    """Build the causal watchdog error, retaining abort-side transport detail."""
+
+    return ProviderStaleError(
+        detail,
+        provider=str(getattr(agent, "provider", "") or "unknown"),
+        model=str(api_kwargs.get("model") or getattr(agent, "model", "") or "unknown"),
+        stale_timeout_seconds=threshold,
+        estimated_context_tokens=estimate_request_context_tokens(api_kwargs),
+        phase=phase,
+        transport_error=transport_error,
+    )
+
+
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
@@ -137,6 +165,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     provider fallback.
     """
     result = {"response": None, "error": None}
+    failure_state = AuthoritativeFailureState()
     request_client_holder = {"client": None, "owner_tid": None}
     request_client_lock = threading.Lock()
 
@@ -229,7 +258,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
-            result["error"] = e
+            result["error"] = failure_state.set_worker_error(e)
         finally:
             _close_request_client_once("request_complete")
 
@@ -397,17 +426,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the worker to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
-                    )
+            _transport_error = result.get("error")
+            if _silent_hint:
+                _detail = (
+                    f"Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                )
+            else:
+                _detail = (
+                    f"Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                )
+            result["error"] = failure_state.set_watchdog_failure(
+                _provider_stale_error(
+                    agent,
+                    api_kwargs,
+                    elapsed=_elapsed,
+                    threshold=_ttfb_timeout,
+                    phase="time_to_first_byte",
+                    transport_error=_transport_error,
+                    detail=_detail,
+                )
+            )
             break
 
         # Stream-idle detector: the Codex backend emitted at least one SSE
@@ -442,11 +482,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
-                    f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
-                    f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
+            _transport_error = result.get("error")
+            result["error"] = failure_state.set_watchdog_failure(
+                _provider_stale_error(
+                    agent,
+                    api_kwargs,
+                    elapsed=_event_stale_elapsed,
+                    threshold=_codex_idle_timeout,
+                    phase="stream_idle",
+                    transport_error=_transport_error,
+                    detail=(
+                        f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
+                        f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
+                    ),
                 )
+            )
             break
 
         # Stale-call detector: kill the connection if no response
@@ -491,18 +541,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+            _transport_error = result.get("error")
+            if _silent_hint:
+                _detail = (
+                    f"Non-streaming API call timed out after {int(_elapsed)}s "
+                    f"with no response (threshold: {int(_stale_timeout)}s). "
+                    f"{_silent_hint}"
+                )
+            else:
+                _detail = (
+                    f"Non-streaming API call timed out after {int(_elapsed)}s "
+                    f"with no response (threshold: {int(_stale_timeout)}s)"
+                )
+            result["error"] = failure_state.set_watchdog_failure(
+                _provider_stale_error(
+                    agent,
+                    api_kwargs,
+                    elapsed=_elapsed,
+                    threshold=_stale_timeout,
+                    phase="final_synthesis" if inspect_payload_workload(api_kwargs).is_synthesis else "provider_response",
+                    transport_error=_transport_error,
+                    detail=_detail,
+                )
+            )
             break
 
         if agent._interrupt_requested:
@@ -518,8 +579,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
-    if result["error"] is not None:
-        raise result["error"]
+    failure = failure_state.get()
+    if failure is not None:
+        raise failure
     return result["response"]
 
 
@@ -1558,6 +1620,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # callbacks — same UX as Anthropic and chat_completions streaming.
     if agent.api_mode == "bedrock_converse":
         result = {"response": None, "error": None}
+        failure_state = AuthoritativeFailureState()
+        bedrock_response_holder = {"response": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
 
@@ -1582,6 +1646,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 client = _get_bedrock_runtime_client(region)
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
+                    bedrock_response_holder["response"] = raw_response
                 except Exception as _bedrock_exc:
                     # Evict the cached client on stale-connection failures
                     # so the outer retry loop builds a fresh client/pool.
@@ -1610,19 +1675,54 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     on_interrupt_check=lambda: agent._interrupt_requested,
                 )
             except Exception as e:
-                result["error"] = e
+                result["error"] = failure_state.set_worker_error(e)
 
+        _bedrock_payload = dict(api_kwargs)
+        _bedrock_stale_timeout = float(agent._compute_non_stream_stale_timeout(_bedrock_payload))
+        _bedrock_started = time.time()
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
+            _bedrock_elapsed = time.time() - _bedrock_started
+            if _bedrock_elapsed > _bedrock_stale_timeout:
+                stale = _provider_stale_error(
+                    agent,
+                    _bedrock_payload,
+                    elapsed=_bedrock_elapsed,
+                    threshold=_bedrock_stale_timeout,
+                    phase="final_synthesis" if inspect_payload_workload(_bedrock_payload).is_synthesis else "provider_response",
+                    transport_error=failure_state.get(),
+                    detail=(
+                        f"Bedrock stream produced no completed response for {int(_bedrock_elapsed)}s "
+                        f"(threshold: {int(_bedrock_stale_timeout)}s)"
+                    ),
+                )
+                result["error"] = failure_state.set_watchdog_failure(stale)
+                raw_response = bedrock_response_holder.get("response")
+                event_stream = raw_response.get("stream") if isinstance(raw_response, dict) else None
+                close = getattr(event_stream, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                try:
+                    from agent.bedrock_adapter import invalidate_runtime_client
+                    invalidate_runtime_client(_bedrock_payload.get("__bedrock_region__", "us-east-1"))
+                except Exception:
+                    pass
+                t.join(timeout=2.0)
+                break
             if agent._interrupt_requested:
                 raise InterruptedError("Agent interrupted during Bedrock API call")
-        if result["error"] is not None:
-            raise result["error"]
+        failure = failure_state.get()
+        if failure is not None:
+            raise failure
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
+    failure_state = AuthoritativeFailureState()
     request_client_holder = {"client": None, "diag": None, "owner_tid": None}
     request_client_lock = threading.Lock()
 
@@ -2063,6 +2163,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_chat_completions()
                     return  # success
                 except Exception as e:
+                    # Once the outer stale watchdog fires, its causal failure
+                    # is authoritative.  Attach this abort-side transport error
+                    # and stop the inner identical-stream retry loop.
+                    if isinstance(failure_state.get(), ProviderStaleError):
+                        result["error"] = failure_state.set_worker_error(e)
+                        return
                     _is_timeout = isinstance(
                         e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout)
                     )
@@ -2129,7 +2235,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
-                            result["error"] = e
+                            result["error"] = failure_state.set_worker_error(e)
                             return
                         # Tool call was in-flight AND error is transient:
                         # retry silently.  Clear per-attempt state so the
@@ -2276,42 +2382,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
-                    result["error"] = e
+                    result["error"] = failure_state.set_worker_error(e)
                     return
         except InterruptedError as e:
             # The interrupt may be noticed inside the worker thread before
             # the polling loop sees it. Surface it through the normal result
             # channel so callers never miss a fast pre-retry interrupt.
-            result["error"] = e
+            result["error"] = failure_state.set_worker_error(e)
             return
         finally:
             _close_request_client_once("stream_request_complete")
 
-    # Provider-configured stale timeout takes priority over env default.
+    # Explicit provider/model or environment configuration remains exact.
+    # Otherwise use the same provider-neutral workload policy as non-streaming
+    # requests so synthesis and reasoning receive a realistic first-token window.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _env_stale_raw = os.getenv("HERMES_STREAM_STALE_TIMEOUT")
     if _cfg_stale is not None:
-        _stream_stale_timeout_base = _cfg_stale
-    else:
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-    # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
-    # for prefill on large contexts.  Disable the stale detector unless
-    # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
+        _stream_stale_timeout = float(_cfg_stale)
+    elif _env_stale_raw is not None:
+        _stream_stale_timeout = float(_env_stale_raw)
+    elif agent.base_url and is_local_endpoint(agent.base_url):
         _stream_stale_timeout = float("inf")
         logger.debug("Local provider detected (%s) — stale stream timeout disabled", agent.base_url)
     else:
-        # Scale the stale timeout for large contexts: slow models (like Opus)
-        # can legitimately think for minutes before producing the first token
-        # when the context is large.  Without this, the stale detector kills
-        # healthy connections during the model's thinking phase, producing
-        # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = estimate_request_context_tokens(api_kwargs)
-        if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-        elif _est_tokens > 50_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
-        else:
-            _stream_stale_timeout = _stream_stale_timeout_base
+        _stream_stale_timeout = float(agent._compute_non_stream_stale_timeout(api_kwargs))
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -2352,24 +2447,38 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                 f"(model: {api_kwargs.get('model', 'unknown')}, "
                 f"context: ~{_est_ctx:,} tokens). "
-                f"Reconnecting..."
+                f"Aborting call for fallback recovery."
             )
+            _stale_error = _provider_stale_error(
+                agent,
+                api_kwargs,
+                elapsed=_stale_elapsed,
+                threshold=_stream_stale_timeout,
+                phase="final_synthesis" if inspect_payload_workload(api_kwargs).is_synthesis else "provider_response",
+                transport_error=None,
+                detail=(
+                    f"Streaming API call produced no chunks for {int(_stale_elapsed)}s "
+                    f"(threshold: {int(_stream_stale_timeout)}s)"
+                ),
+            )
+            result["error"] = failure_state.set_watchdog_failure(_stale_error)
             try:
-                _close_request_client_once("stale_stream_kill")
+                if agent.api_mode == "anthropic_messages":
+                    agent._anthropic_client.close()
+                    agent._rebuild_anthropic_client()
+                else:
+                    _close_request_client_once("stale_stream_kill")
             except Exception:
                 pass
-            # Rebuild the primary client too — its connection pool
-            # may hold dead sockets from the same provider outage.
             try:
                 agent._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
             except Exception:
                 pass
-            # Reset the timer so we don't kill repeatedly while
-            # the inner thread processes the closure.
-            last_chunk_time["t"] = time.time()
             agent._touch_activity(
-                f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
+                f"stale stream detected after {int(_stale_elapsed)}s, aborting for fallback"
             )
+            t.join(timeout=2.0)
+            break
 
         if agent._interrupt_requested:
             try:
@@ -2381,7 +2490,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during streaming API call")
-    if result["error"] is not None:
+    failure = failure_state.get()
+    if failure is not None:
+        result["error"] = failure
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make

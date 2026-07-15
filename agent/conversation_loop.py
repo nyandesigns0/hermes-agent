@@ -30,6 +30,12 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.provider_failure_policy import (
+    provider_route_health,
+    record_provider_stale,
+    record_provider_success,
+    stale_recovery_action,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
@@ -1155,6 +1161,24 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
 
         while retry_count < max_retries:
+            # Short-lived circuit breaker for routes that stayed silent in
+            # multiple recent calls.  It is process-local, clears on success,
+            # and only skips the route when a configured fallback exists.
+            _route_health = provider_route_health(
+                provider=getattr(agent, "provider", "") or "",
+                model=getattr(agent, "model", "") or "",
+                base_url=getattr(agent, "base_url", "") or "",
+            )
+            if _route_health.degraded and agent._has_pending_fallback():
+                agent._buffer_status(
+                    "⚠️ Current provider/model route is temporarily degraded after repeated silent calls — using fallback..."
+                )
+                if agent._try_activate_fallback(reason=FailoverReason.provider_stale):
+                    retry_count = 0
+                    compression_attempts = 0
+                    primary_recovery_attempted = False
+                    continue
+
             # ── Nous Portal rate limit guard ──────────────────────
             # If another session already recorded that Nous is rate-
             # limited, skip the API call entirely.  Each attempt
@@ -1934,6 +1958,13 @@ def run_conversation(
                         )
                 
                 has_retried_429 = False  # Reset on success
+                record_provider_success(
+                    provider=getattr(agent, "provider", "") or "",
+                    model=getattr(agent, "model", "") or "",
+                    base_url=getattr(agent, "base_url", "") or "",
+                )
+                agent._provider_stale_attempts = 0
+                agent._provider_stale_timeout_multiplier = 1.0
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
                 # usable content. Empty responses still loop through the
@@ -2267,6 +2298,84 @@ def run_conversation(
                 )
                 if recovered_with_pool:
                     continue
+
+                # A watchdog-triggered stale failure has already proved that
+                # the unchanged route remained silent.  Do not feed it into
+                # the generic three-attempt transport loop.  Prefer a healthy
+                # fallback immediately; without one, retry the same route only
+                # once with a larger adaptive silence allowance.
+                if classified.reason == FailoverReason.provider_stale:
+                    _route_health = record_provider_stale(
+                        provider=getattr(agent, "provider", "") or "",
+                        model=getattr(agent, "model", "") or "",
+                        base_url=getattr(agent, "base_url", "") or "",
+                    )
+                    if _route_health.degraded:
+                        agent._buffer_status(
+                            "⚠️ Provider/model route marked temporarily degraded after repeated silent calls."
+                        )
+                    _stale_attempts = int(
+                        getattr(agent, "_provider_stale_attempts", 0) or 0
+                    )
+                    _has_fallback = agent._has_pending_fallback()
+                    _stale_action = stale_recovery_action(
+                        reason=classified.reason,
+                        stale_attempts=_stale_attempts,
+                        has_fallback=_has_fallback,
+                    )
+                    if _stale_action == "fallback":
+                        agent._buffer_status(
+                            "⚠️ Provider stayed silent — switching to fallback instead of repeating the same request..."
+                        )
+                        if agent._try_activate_fallback(reason=classified.reason):
+                            agent._provider_stale_attempts = 0
+                            agent._provider_stale_timeout_multiplier = 1.0
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        # A configured route can become unavailable between the
+                        # pending check and activation.  Degrade to the bounded
+                        # same-route retry instead of entering generic retries.
+                        _stale_action = stale_recovery_action(
+                            reason=classified.reason,
+                            stale_attempts=_stale_attempts,
+                            has_fallback=False,
+                        )
+
+                    if _stale_action == "retry_expanded":
+                        agent._provider_stale_attempts = _stale_attempts + 1
+                        agent._provider_stale_timeout_multiplier = 2.0
+                        agent._buffer_status(
+                            "⚠️ Provider stayed silent and no fallback is available — retrying once with an expanded response window..."
+                        )
+                        continue
+
+                    agent._flush_status_buffer()
+                    _stale_summary = agent._summarize_api_error(api_error)
+                    agent._emit_status(
+                        "❌ Provider stayed silent after bounded recovery; completed tool evidence was preserved."
+                    )
+                    if api_kwargs is not None:
+                        agent._dump_api_request_debug(
+                            api_kwargs,
+                            reason="provider_stale_recovery_exhausted",
+                            error=api_error,
+                        )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": (
+                            "Provider response timed out after bounded stale-call recovery. "
+                            "Completed tool work remains available in the session."
+                        ),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "partial": True,
+                        "failure_class": "provider_stale",
+                        "error": f"provider_stale: {_stale_summary}",
+                    }
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's

@@ -13,6 +13,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent.provider_failure_policy import ProviderStaleError
 
 
 class FakeRequestClient:
@@ -107,9 +108,10 @@ def test_stale_non_stream_close_is_single_owner(monkeypatch):
     agent = _build_agent()
     agent._compute_non_stream_stale_timeout = lambda api_payload: 0.01
 
-    with pytest.raises(APIConnectionError):
+    with pytest.raises(ProviderStaleError) as raised:
         agent._interruptible_api_call({"model": agent.model, "messages": []})
 
+    assert isinstance(raised.value.__cause__, APIConnectionError)
     assert request_client.close_calls == 1
 
 

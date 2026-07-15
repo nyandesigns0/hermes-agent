@@ -149,6 +149,7 @@ class TestStalenessCheck(unittest.TestCase):
         result = json.loads(write_file_tool(self._tmpfile, "new", task_id="task_b"))
         self.assertNotIn("_warning", result)
 
+    @patch("tools.terminal_tool._resolve_container_task_id", lambda task_id="default": task_id)
     @patch("tools.file_tools._get_file_ops")
     def test_relative_path_uses_live_cwd_for_staleness_tracking(self, mock_ops):
         """Relative-path stale tracking must follow the live terminal cwd."""

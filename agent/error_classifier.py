@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.provider_failure_policy import ProviderStaleError
+
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +39,7 @@ class FailoverReason(enum.Enum):
     server_error = "server_error"        # 500/502 — internal server error, retry
 
     # Transport
+    provider_stale = "provider_stale"      # Watchdog observed provider silence — fallback before retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
 
     # Context / payload
@@ -529,6 +532,21 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A watchdog-triggered abort is categorically different from an organic
+    # read timeout.  It already proved that the unchanged route stayed silent,
+    # so prefer fallback and avoid the generic identical-retry loop.
+    if isinstance(error, ProviderStaleError):
+        return _result(
+            FailoverReason.provider_stale,
+            retryable=True,
+            should_fallback=True,
+            error_context={
+                "phase": error.phase,
+                "stale_timeout_seconds": error.stale_timeout_seconds,
+                "estimated_context_tokens": error.estimated_context_tokens,
+            },
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

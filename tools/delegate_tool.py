@@ -19,6 +19,8 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 import os
@@ -221,28 +223,75 @@ def list_active_subagents() -> List[Dict[str, Any]]:
         ]
 
 
+def _force_redact_evidence_text(text: Any) -> str:
+    """Redact evidence tails more strictly than general log redaction."""
+
+    from agent.redact import redact_sensitive_text
+
+    if not isinstance(text, str):
+        try:
+            text = json.dumps(text, ensure_ascii=False, default=str)
+        except Exception:
+            text = str(text)
+    redacted = redact_sensitive_text(text, force=True)
+
+    sensitive_keys = {
+        "access_token", "refresh_token", "id_token", "token", "api_key",
+        "apikey", "client_secret", "password", "auth", "jwt", "session",
+        "secret", "key", "code", "signature", "x-amz-signature",
+    }
+
+    def _redact_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            parts = urlsplit(raw)
+        except Exception:
+            return raw
+        netloc = parts.netloc
+        if "@" in netloc:
+            _userinfo, _, host = netloc.rpartition("@")
+            netloc = f"***@{host}"
+        if parts.query:
+            pairs = []
+            for key, value in parse_qsl(parts.query, keep_blank_values=True):
+                if key.lower() in sensitive_keys:
+                    pairs.append((key, "***"))
+                else:
+                    pairs.append((key, value))
+            query = urlencode(pairs, doseq=True, quote_via=quote)
+        else:
+            query = parts.query
+        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+    redacted = re.sub(r"\b(?:https?|wss?|ftp)://[^\s\"'<>]+", _redact_url, redacted)
+    redacted = re.sub(
+        r"(?i)(Authorization\s*:\s*)([^\r\n\"']+)",
+        lambda m: m.group(1) + "***",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)([\"']Authorization[\"']\s*:\s*[\"'])([^\"']+)([\"'])",
+        lambda m: m.group(1) + "***" + m.group(3),
+        redacted,
+    )
+    return redacted
+
+
 def _extract_output_tail(
     result: Dict[str, Any],
     *,
     max_entries: int = 12,
     max_chars: int = 8000,
 ) -> List[Dict[str, Any]]:
-    """Pull the last N tool-call results from a child's conversation.
-
-    Powers the overlay's "Output" section — the cc-swarm-parity feature.
-    We reuse the same messages list the trajectory saver walks, taking
-    only the tail to keep event payloads small.  Each entry is
-    ``{tool, preview, is_error}``.
-    """
+    """Pull a bounded, force-redacted tail of child tool results."""
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
         return []
 
-    # Walk in reverse to build a tail; stop when we have enough.
     tail: List[Dict[str, Any]] = []
     pending_call_by_id: Dict[str, str] = {}
+    remaining_chars = max(0, int(max_chars))
 
-    # First pass (forward): build tool_call_id -> tool_name map
     for msg in messages:
         if not isinstance(msg, dict):
             continue
@@ -253,39 +302,38 @@ def _extract_output_tail(
                 if tc_id:
                     pending_call_by_id[tc_id] = str(fn.get("name") or "tool")
 
-    # Second pass (reverse): pick tool results, newest first
     for msg in reversed(messages):
-        if len(tail) >= max_entries:
+        if len(tail) >= max_entries or remaining_chars <= 0:
             break
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        content = msg.get("content") or ""
-        if not isinstance(content, str):
-            content = str(content)
+        raw_content = msg.get("content") or ""
+        if isinstance(raw_content, str):
+            content = raw_content
+        else:
+            try:
+                content = json.dumps(raw_content, ensure_ascii=False, default=str)
+            except Exception:
+                content = str(raw_content)
         is_error = _looks_like_error_output(content)
         tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
-        # Preserve line structure so the overlay's wrapped scroll region can
-        # show real output rather than a whitespace-collapsed blob. We still
-        # cap the payload size to keep events bounded.
-        preview = content[:max_chars]
+        preview = _force_redact_evidence_text(content)[:remaining_chars]
+        remaining_chars -= len(preview)
         tail.append({"tool": tool_name, "preview": preview, "is_error": is_error})
 
-    tail.reverse()  # restore chronological order for display
+    tail.reverse()
     return tail
 
 
-def _looks_like_error_output(content: str) -> bool:
-    """Conservative stderr/error detector for tool-result previews.
-
-    The old heuristic flagged any preview containing the substring "error",
-    which painted perfectly normal terminal/json output red.  We now only
-    mark output as an error when there is stronger evidence:
-      - structured JSON with an ``error`` key
-      - structured JSON with ``status`` of error/failed
-      - first line starts with a classic error marker
-    """
-    if not content:
+def _looks_like_error_output(content: Any) -> bool:
+    """Conservative stderr/error detector for tool-result previews."""
+    if content is None or content == "":
         return False
+    if not isinstance(content, str):
+        try:
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        except Exception:
+            content = str(content)
 
     head = content.lstrip()
     if head.startswith("{") or head.startswith("["):
@@ -293,6 +341,8 @@ def _looks_like_error_output(content: str) -> bool:
             parsed = json.loads(content)
             if isinstance(parsed, dict):
                 if parsed.get("error"):
+                    return True
+                if parsed.get("success") is False or parsed.get("ok") is False:
                     return True
                 status = str(parsed.get("status") or "").strip().lower()
                 if status in {"error", "failed", "failure", "timeout"}:
@@ -1624,6 +1674,10 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif result.get("failed"):
+            # A user-facing failure explanation is not a completed delegated
+            # task.  Evidence salvage below may promote this to ``partial``.
+            status = "failed"
         elif summary:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -1653,10 +1707,17 @@ def _run_single_child(
                         if tc_id:
                             trace_by_id[tc_id] = entry_t
                 elif msg.get("role") == "tool":
-                    content = msg.get("content", "")
+                    raw_content = msg.get("content", "")
+                    if isinstance(raw_content, str):
+                        content = raw_content
+                    else:
+                        try:
+                            content = json.dumps(raw_content, ensure_ascii=False, default=str)
+                        except Exception:
+                            content = str(raw_content)
                     is_error = _looks_like_error_output(content)
                     result_meta = {
-                        "result_bytes": len(content),
+                        "result_bytes": len(content.encode("utf-8", errors="replace")),
                         "status": "error" if is_error else "ok",
                     }
                     # Match by tool_call_id for parallel calls
@@ -1668,9 +1729,28 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
+        successful_tool_results = sum(
+            1 for item in tool_trace if item.get("status") == "ok"
+        )
+        evidence_result_bytes = sum(
+            int(item.get("result_bytes", 0) or 0) for item in tool_trace
+        )
+        failure_class = str(result.get("failure_class") or "").strip()
+        if not failure_class and "provider_stale" in str(result.get("error") or ""):
+            failure_class = "provider_stale"
+        if status == "failed" and successful_tool_results > 0:
+            status = "partial"
+        evidence_tail = (
+            _extract_output_tail(result, max_entries=8, max_chars=1200)
+            if status == "partial"
+            else []
+        )
+
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif status == "partial":
+            exit_reason = failure_class or "partial"
         elif completed:
             exit_reason = "completed"
         else:
@@ -1685,6 +1765,14 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "completed": bool(completed and status == "completed"),
+            "partial": status == "partial",
+            "failure_class": failure_class or None,
+            "evidence": {
+                "successful_tool_results": successful_tool_results,
+                "result_bytes": evidence_result_bytes,
+            },
+            "evidence_tail": evidence_tail,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -1716,7 +1804,7 @@ def _run_single_child(
                 else 0.0
             ),
         }
-        if status == "failed":
+        if status in {"failed", "partial"}:
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
         # Cross-agent file-state reminder.  If this subagent wrote any
@@ -2545,6 +2633,13 @@ def _build_top_level_description() -> str:
         "- Reasoning-heavy subtasks (debugging, code review, research synthesis)\n"
         "- Tasks that would flood your context with intermediate data\n"
         "- Parallel independent workstreams (research A and B simultaneously)\n\n"
+        "DECOMPOSITION FOR BROAD AUDITS:\n"
+        "- For a complete audit, multi-source reconciliation, or several long artifacts, "
+        "prefer a map/reduce shape: delegate bounded extraction per source or section, "
+        "then synthesize the compact findings in a final task.\n"
+        "- Avoid making one child load multiple complete long documents when independent "
+        "evidence collection can be split safely. This reduces provider-stale synthesis "
+        "failures and preserves partial findings.\n\n"
         "WHEN NOT TO USE (use these instead):\n"
         "- Mechanical multi-step work with no reasoning needed -> use execute_code\n"
         "- Single tool call -> just call the tool directly\n"

@@ -93,6 +93,13 @@ def test_cached_sudo_password_is_used_when_env_is_unset(monkeypatch):
 def test_cached_sudo_password_isolated_by_session_key(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_sudo_password_cache_scope",
+        lambda: f"session:{terminal_tool.os.getenv('HERMES_SESSION_KEY', '')}"
+        if terminal_tool.os.getenv("HERMES_SESSION_KEY", "")
+        else f"thread:{terminal_tool.threading.get_ident()}",
+    )
 
     monkeypatch.setenv("HERMES_SESSION_KEY", "session-a")
     terminal_tool._set_cached_sudo_password("alpha-pass")

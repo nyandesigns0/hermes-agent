@@ -188,6 +188,32 @@ Lower it for fast local models; raise it for slow reasoning models on hard probl
 If a subagent times out having made **zero** API calls (usually: provider unreachable, auth failure, or tool-schema rejection), `delegate_task` writes a structured diagnostic to `~/.hermes/logs/subagent-timeout-<session>-<timestamp>.log` containing the subagent's config snapshot, credential-resolution trace, and any early error messages. Much easier to root-cause than the previous silent-timeout behavior.
 :::
 
+## Silent Provider Recovery
+
+A child can finish its file or tool work and then wait on a provider that emits no usable response during final synthesis. Hermes treats this as `provider_stale`, not as the `ReadError` or `Broken pipe` that may be produced when the watchdog closes the stalled socket.
+
+Recovery is bounded and causal:
+
+1. If a fallback route is configured, Hermes switches to it immediately instead of repeating the identical silent request.
+2. Without a fallback, Hermes retries the same route once with an expanded adaptive silence allowance.
+3. If that request also stays silent, Hermes stops rather than consuming the generic three-retry transport budget.
+4. Completed successful tool results are returned as a structured `status="partial"` delegation result with `failure_class`, tool trace, evidence byte counts, and a bounded evidence tail.
+5. Two silent failures on the same provider/model endpoint within ten minutes mark that route degraded for ten minutes. While a fallback remains, later calls skip the degraded route. Any successful response closes the circuit immediately.
+
+The implicit stale timeout scales for large contexts, high reasoning effort, and final synthesis after tool results. Explicit provider/model configuration remains authoritative:
+
+```yaml
+providers:
+  openai-codex:
+    models:
+      gpt-5.6-sol:
+        stale_timeout_seconds: 240
+```
+
+`request_timeout_seconds`, `stale_timeout_seconds`, and `delegation.child_timeout_seconds` are separate controls: total request lifetime, provider-silence allowance, and complete child lifetime respectively. Configure at least one fallback with `hermes fallback add` when delegated work must survive a provider outage.
+
+For complete audits or multi-source reconciliation, use a map/reduce shape: bounded extraction per source or section, followed by synthesis over compact findings. The `delegate_task` tool description includes this guidance automatically.
+
 ## Monitoring Running Subagents (`/agents`)
 
 The TUI ships a `/agents` overlay (alias `/tasks`) that turns recursive `delegate_task` fan-out into a first-class audit surface:
@@ -240,7 +266,7 @@ For **durable long-running work** that must survive interrupts or outlive the cu
 - **Nested delegation is opt-in** — only `role="orchestrator"` children can delegate further, and only when `max_spawn_depth` is raised from its default of 1 (flat). Disable globally with `orchestrator_enabled: false`.
 - Leaf subagents **cannot** call: `delegate_task`, `clarify`, `memory`, `send_message`, `execute_code`. Orchestrator subagents retain `delegate_task` but still cannot use the other four.
 - **Interrupt propagation** — interrupting the parent interrupts all active children (including grandchildren under orchestrators)
-- Only the final summary enters the parent's context, keeping token usage efficient
+- Final summaries normally enter the parent's context; failed children with successful tool work instead return bounded structured partial evidence
 - Subagents inherit the parent's **API key, provider configuration, and credential pool** (enabling key rotation on rate limits)
 
 ## Delegation vs execute_code

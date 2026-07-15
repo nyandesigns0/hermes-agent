@@ -188,3 +188,53 @@ providers:
 
     agent = _make_agent(tmp_path)
     assert agent._compute_non_stream_stale_timeout({"input": "hi"}) == 1800.0
+
+
+def test_moderate_codex_synthesis_gets_adaptive_allowance(monkeypatch, tmp_path):
+    """A tool-heavy final synthesis should not use the short-request 90s floor."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+    _write_config(tmp_path, "")
+
+    agent = _make_agent(tmp_path, reasoning_config={"effort": "medium"})
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "Audit both sources and return the final reconciliation.",
+        "input": [
+            {"role": "user", "content": "audit"},
+            {"type": "function_call", "name": "read_file", "arguments": "{}"},
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "evidence" * 7000,
+            },
+        ],
+    }
+
+    assert agent._compute_non_stream_stale_timeout(payload) >= 180.0
+
+
+def test_explicit_stale_timeout_is_not_adaptively_increased(monkeypatch, tmp_path):
+    """Explicit provider config remains authoritative for advanced operators."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(tmp_path, """\
+providers:
+  openai-codex:
+    stale_timeout_seconds: 123
+""")
+    monkeypatch.delenv("HERMES_API_CALL_STALE_TIMEOUT", raising=False)
+
+    import importlib
+    from hermes_cli import timeouts as to_mod
+    importlib.reload(to_mod)
+
+    agent = _make_agent(tmp_path, reasoning_config={"effort": "high"})
+    payload = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {"type": "function_call_output", "call_id": "c", "output": "x" * 100_000}
+        ],
+    }
+    assert agent._compute_non_stream_stale_timeout(payload) == 123.0
