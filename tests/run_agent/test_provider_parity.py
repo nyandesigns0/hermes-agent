@@ -927,6 +927,15 @@ class TestBuildAssistantMessage:
 class TestAuxiliaryClientProviderPriority:
     """Verify auxiliary client resolution doesn't break for any provider."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_auxiliary_provider_health(self):
+        """Keep payment-health backoff from leaking into priority assertions."""
+        from agent.auxiliary_client import _reset_aux_unhealthy_cache
+
+        _reset_aux_unhealthy_cache()
+        yield
+        _reset_aux_unhealthy_cache()
+
     def test_openrouter_always_wins(self, monkeypatch):
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         from agent.auxiliary_client import get_text_auxiliary_client
